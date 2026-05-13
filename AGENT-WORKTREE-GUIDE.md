@@ -72,7 +72,9 @@ Parameters:
 - `-Branch` (required) — branch name; created from HEAD if it doesn't exist.
 - `-Source` (default: cwd) — source worktree path.
 - `-Dest` (default: `<source>-<branch>` sibling dir).
-- `-Clone` (default: `Library, Temp, Logs, obj, Packages` — Unity defaults).
+- `-Clone` (default: `Library, Logs, obj, Packages` — Unity defaults; `Temp/` is
+  deliberately excluded because `Temp/UnityLockfile` carries the source Editor's
+  live PID and would block opening the new worktree).
 - `-Force` — proceed without CoW (falls back to full copy; slow).
 
 ## Workflow for an agent
@@ -111,9 +113,16 @@ without disturbing the user's current state:
 
 ## Caveats and pitfalls
 
-- **One Unity Editor per project at a time.** Even though worktrees are
-  independent on disk, opening the same project in two Editors corrupts the
-  asset database. `UnityLockfile` blocks it, but don't try to force around it.
+- **Two worktrees can each have their own Unity Editor open** — they're separate
+  project paths with separate `Library/` and `Temp/`. The constraint is *one
+  Editor per worktree*: don't launch two Editors against the same on-disk path.
+- **Never clone `Temp/` between worktrees.** `Temp/UnityLockfile` contains the
+  source Editor's PID; if the source Editor is running, Unity will see the live
+  PID in the cloned lockfile and refuse to open the new worktree. The script
+  excludes `Temp/` from the default clone list and also passes
+  `robocopy /XF UnityLockfile` as a belt-and-suspenders guard. If you ever hit
+  this manually (e.g. after a hand-rolled copy), delete `Temp/UnityLockfile` in
+  the new worktree before opening it.
 - **Cross-volume copies break CoW.** If `-Dest` is on a different volume than
   `-Source`, robocopy falls back to full copy. The script warns about this
   and refuses unless `-Force` is passed.

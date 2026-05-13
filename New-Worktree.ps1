@@ -38,8 +38,10 @@
 
 .NOTES
     - Source and Dest MUST be on the same ReFS/Dev Drive volume for block cloning.
-    - Never open the same Unity project in two Editor instances at once — UnityLockfile
-      prevents it but the asset DB can still get confused if you fight it.
+    - Temp/ is intentionally excluded from the default clone list: it's session state,
+      and Temp/UnityLockfile contains the source Editor's live PID — cloning it would
+      make Unity refuse to open the new worktree. UnityLockfile is also excluded
+      defensively via robocopy /XF if a caller passes Temp explicitly.
     - Cleanup later with:  git worktree remove <dest>   (then delete leftover dirs if any)
 #>
 
@@ -52,7 +54,7 @@ param(
 
     [string]$Dest,
 
-    [string[]]$Clone = @('Library', 'Temp', 'Logs', 'obj', 'Packages'),
+    [string[]]$Clone = @('Library', 'Logs', 'obj', 'Packages'),
 
     [switch]$Force
 )
@@ -118,7 +120,9 @@ foreach ($dir in $Clone) {
     }
     Write-Step "clone $dir/"
     # /E recursive incl. empty, /MT:16 multithread, /NFL/NDL/NJH/NP quiet, /R:1 /W:1 fast-fail
-    & robocopy $srcDir $dstDir /E /MT:16 /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Null
+    # /XF UnityLockfile: never clone Unity's PID-bearing lock — a live source PID would
+    # make Unity refuse to open the new worktree.
+    & robocopy $srcDir $dstDir /E /MT:16 /NFL /NDL /NJH /NP /R:1 /W:1 /XF UnityLockfile | Out-Null
     # robocopy exit codes 0-7 are success; 8+ are real failures
     if ($LASTEXITCODE -ge 8) {
         Write-Warn2 "robocopy reported errors for $dir (exit $LASTEXITCODE)"
