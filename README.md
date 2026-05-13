@@ -34,10 +34,16 @@ New-Worktree.ps1 -Branch <branch> [-Source <path>] [-Dest <path>] [-Clone <dirs>
 | Parameter | Default | Description |
 |---|---|---|
 | `-Branch` | (required) | Branch to check out. Created from HEAD if missing. |
-| `-Source` | cwd | Source worktree path. |
-| `-Dest` | `<source>-<branch>` sibling | Destination. Must be on the same volume as source. |
+| `-Source` | cwd | Source Unity project path (the dir with `ProjectSettings/`). |
+| `-Dest` | `<repo-parent>\<repo>-<branch>` | Worktree root (peer of the repo). Must be on the same volume as source. |
 | `-Clone` | `Library, Logs, obj, Packages` | Dirs to block-clone. Pass `@()` to skip. |
 | `-Force` | off | Proceed without CoW (full byte copy — slow). |
+
+Handles two layouts:
+- **Flat**: Unity project IS the git repo root.
+- **Nested**: Unity project is a subdir of the repo (e.g. `<repo>/UnityProject/`).
+  The cache clone targets the matching subdir inside the new worktree, and the
+  final `Open Unity at: ...` line shows where the actual Unity project lives.
 
 Non-Unity example: `-Clone @('node_modules', '.next')` or `-Clone @('target')`.
 
@@ -45,6 +51,10 @@ Non-Unity example: `-Clone @('node_modules', '.next')` or `-Clone @('target')`.
 
 - `Temp/` is **not** cloned by default — `Temp/UnityLockfile` holds the source
   Editor's PID and would block opening the new worktree.
+- **Commit or stash before cloning.** Uncommitted changes (especially to
+  `ProjectSettings.asset`) make the cloned Library mismatch the worktree's
+  checked-out content, triggering a Unity mass-reimport. The script warns but
+  doesn't block.
 - One Editor per worktree path (two worktrees can each have their own).
 - Cross-volume or NTFS → full copy fallback (the script refuses without `-Force`).
 - Always `git worktree remove`; don't `rm` the directory first.

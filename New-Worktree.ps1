@@ -9,14 +9,21 @@
     consume extra space when modified. This makes spinning up a fresh Unity worktree
     (with a populated Library/) nearly instant and ~free in disk usage.
 
+    Handles two layouts:
+      - Flat: Unity project root IS the git repo root.
+      - Nested: Unity project is a subdirectory of a larger repo (e.g. <repo>/UnityProject/).
+                The cache clone targets the matching subdir inside the new worktree.
+
 .PARAMETER Branch
     Branch to check out in the new worktree. Created from HEAD if it doesn't exist.
 
 .PARAMETER Source
-    Path to the source worktree. Defaults to the current directory.
+    Path to the source Unity project (the directory containing ProjectSettings/).
+    Defaults to the current directory.
 
 .PARAMETER Dest
-    Destination path for the new worktree. Defaults to "<Source>-<Branch>" alongside the source.
+    Destination path for the worktree (the repo root inside the worktree, NOT the
+    Unity project subdir). Defaults to "<repo-parent>\<repo-leaf>-<branch>".
 
 .PARAMETER Clone
     Directories to block-clone from source into the new worktree (gitignored caches).
@@ -28,7 +35,7 @@
 
 .EXAMPLE
     .\New-Worktree.ps1 -Branch feature/inventory
-    # Creates ..\<repo>-feature-inventory next to the current repo, clones Library/ etc.
+    # Creates ..\<repo>-feature-inventory, clones Library/ etc. into the Unity subdir.
 
 .EXAMPLE
     .\New-Worktree.ps1 -Branch experiment -Source V:\unity\MyGame -Dest V:\unity\MyGame-exp
@@ -42,7 +49,10 @@
       and Temp/UnityLockfile contains the source Editor's live PID — cloning it would
       make Unity refuse to open the new worktree. UnityLockfile is also excluded
       defensively via robocopy /XF if a caller passes Temp explicitly.
-    - Cleanup later with:  git worktree remove <dest>   (then delete leftover dirs if any)
+    - Uncommitted changes in source can cause Unity to mass-reimport on first open
+      (cloned Library was built against the dirty working tree but the new worktree
+      is checked out clean). The script warns but does not block.
+    - Cleanup later with:  git worktree remove <dest>
 #>
 
 [CmdletBinding()]
@@ -65,37 +75,59 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Warn2($msg) { Write-Host "!!  $msg" -ForegroundColor Yellow }
 function Write-Ok($msg)   { Write-Host "OK  $msg" -ForegroundColor Green }
 
-# --- Validate source ---
+# --- Validate source is in a git repo, and locate repo root ---
 $Source = (Resolve-Path $Source).Path
-if (-not (Test-Path (Join-Path $Source '.git'))) {
-    throw "Source '$Source' is not a git repo (no .git found)."
+$RepoRoot = & git -C $Source rev-parse --show-toplevel 2>$null
+if (-not $RepoRoot -or $LASTEXITCODE -ne 0) {
+    throw "Source '$Source' is not inside a git repo."
 }
+$RepoRoot = $RepoRoot -replace '/','\'
 
-# --- Default dest if not provided ---
+# Unity project may BE the repo root, or live in a subdirectory of it.
+$UnityRel = if ($Source -ieq $RepoRoot) { '' }
+            else { $Source.Substring($RepoRoot.Length).TrimStart('\') }
+
+# --- Default dest if not provided: peer of the repo root ---
 if (-not $Dest) {
     $safeBranch = $Branch -replace '[\\/:*?"<>|]', '-'
-    $parent = Split-Path $Source -Parent
-    $leaf   = Split-Path $Source -Leaf
-    $Dest   = Join-Path $parent "$leaf-$safeBranch"
+    $repoParent = Split-Path $RepoRoot -Parent
+    $repoLeaf   = Split-Path $RepoRoot -Leaf
+    $Dest       = Join-Path $repoParent "$repoLeaf-$safeBranch"
 }
+$DestUnity = if ($UnityRel) { Join-Path $Dest $UnityRel } else { $Dest }
+
+Write-Host "    Repo root:     $RepoRoot" -ForegroundColor DarkGray
+Write-Host "    Unity project: $Source  (rel: '$UnityRel')" -ForegroundColor DarkGray
+Write-Host "    Worktree dest: $Dest" -ForegroundColor DarkGray
+Write-Host "    Cache target:  $DestUnity" -ForegroundColor DarkGray
 
 # --- Check filesystem (warn if not ReFS/Dev Drive) ---
 $srcRoot = (Split-Path $Source -Qualifier) + '\'
 $dstRoot = (Split-Path $Dest   -Qualifier) + '\'
 $srcVol  = Get-Volume -FilePath $srcRoot -ErrorAction SilentlyContinue
-$dstVol  = Get-Volume -FilePath $dstRoot -ErrorAction SilentlyContinue
 
 $isCoW = ($srcVol.FileSystemType -eq 'ReFS') -and ($srcRoot -eq $dstRoot)
 if (-not $isCoW) {
     $reason = if ($srcRoot -ne $dstRoot) { "Source and Dest are on different volumes ($srcRoot vs $dstRoot)" }
               else { "Source volume is $($srcVol.FileSystemType), not ReFS" }
     Write-Warn2 "Block cloning unavailable: $reason."
-    Write-Warn2 "robocopy will fall back to full byte copy — slow, full disk usage."
+    Write-Warn2 "robocopy will fall back to full byte copy - slow, full disk usage."
     if (-not $Force) {
         throw "Refusing to proceed without CoW. Re-run with -Force to accept the full copy."
     }
 } else {
-    Write-Ok "Source on ReFS Dev Drive — robocopy will block-clone."
+    Write-Ok "Source on ReFS Dev Drive - robocopy will block-clone."
+}
+
+# --- Warn if source has uncommitted changes ---
+# Cloned Library was built against source's current (dirty) working tree, but
+# `git worktree add` checks out the committed tree in dest. Mismatched input
+# hashes -> Unity mass-reimports. ProjectSettings.asset is the worst offender.
+$dirty = & git -C $Source status --porcelain
+if ($dirty) {
+    Write-Warn2 "Source has uncommitted changes - Unity will likely mass-reimport in the new worktree:"
+    $dirty | ForEach-Object { Write-Warn2 "    $_" }
+    Write-Warn2 "Commit or stash first to avoid this. Continuing anyway..."
 }
 
 # --- Create the worktree ---
@@ -105,22 +137,22 @@ $branchExists = (& git -C $Source branch --list $Branch) -or `
 if ($branchExists) {
     & git -C $Source worktree add $Dest $Branch
 } else {
-    Write-Step "Branch '$Branch' doesn't exist — creating from HEAD"
+    Write-Step "Branch '$Branch' doesn't exist - creating from HEAD"
     & git -C $Source worktree add -b $Branch $Dest
 }
 if ($LASTEXITCODE -ne 0) { throw "git worktree add failed (exit $LASTEXITCODE)" }
 
-# --- Block-clone heavy dirs ---
+# --- Block-clone heavy dirs INTO the Unity project subdir of the worktree ---
 foreach ($dir in $Clone) {
-    $srcDir = Join-Path $Source $dir
-    $dstDir = Join-Path $Dest   $dir
+    $srcDir = Join-Path $Source    $dir
+    $dstDir = Join-Path $DestUnity $dir
     if (-not (Test-Path $srcDir)) {
         Write-Host "    skip: $dir (not in source)" -ForegroundColor DarkGray
         continue
     }
-    Write-Step "clone $dir/"
+    Write-Step "clone $dir/ -> $dstDir"
     # /E recursive incl. empty, /MT:16 multithread, /NFL/NDL/NJH/NP quiet, /R:1 /W:1 fast-fail
-    # /XF UnityLockfile: never clone Unity's PID-bearing lock — a live source PID would
+    # /XF UnityLockfile: never clone Unity's PID-bearing lock - a live source PID would
     # make Unity refuse to open the new worktree.
     & robocopy $srcDir $dstDir /E /MT:16 /NFL /NDL /NJH /NP /R:1 /W:1 /XF UnityLockfile | Out-Null
     # robocopy exit codes 0-7 are success; 8+ are real failures
@@ -131,6 +163,5 @@ foreach ($dir in $Clone) {
 
 Write-Ok "Worktree ready: $Dest"
 Write-Host ""
-Write-Host "Next steps:" -ForegroundColor DarkGray
-Write-Host "  cd '$Dest'" -ForegroundColor DarkGray
-Write-Host "  # When done:  git -C '$Source' worktree remove '$Dest'" -ForegroundColor DarkGray
+Write-Host "Open Unity at: $DestUnity" -ForegroundColor DarkGray
+Write-Host "When done:     git -C '$Source' worktree remove '$Dest'" -ForegroundColor DarkGray
