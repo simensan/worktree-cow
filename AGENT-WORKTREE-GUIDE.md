@@ -1,23 +1,22 @@
-# Agent guide: git worktrees on Windows + Unity + Dev Drive
+# Agent guide: Unity git worktrees on Windows + Dev Drive
 
-Drop this file into a project to teach an AI agent how to spin up a worktree
-correctly here. It's self-contained — the agent can execute the commands
-below without any helper script.
+Drop this file into a Unity project to teach an AI agent how to spin up a
+worktree correctly here. Self-contained — execute the commands below
+directly; no helper script needed.
 
 ## When to use a worktree
 
 Create one for parallel branch work where you can't disturb the current
 working tree:
 
+- The user is actively editing on another branch in Unity.
 - Long-running build artifacts shouldn't be invalidated.
-- The user is actively editing on another branch.
 - Multiple agents working in parallel.
 - Reviewing a PR while keeping the current branch open in Unity.
 
-For a tiny change on a clean tree, just switch branches or stash — skip the
-worktree.
+For a tiny change on a clean tree, just switch branches or stash.
 
-## Why the cache-clone matters (Unity)
+## Why the cache-clone matters
 
 A fresh `git worktree add` only checks out tracked files. Unity's `Library/`,
 `Logs/`, `obj/`, `Packages/` are gitignored caches; without them, Unity does
@@ -43,13 +42,12 @@ fsutil devdrv query <DriveLetter>:
 [System.Environment]::OSVersion.Version
 ```
 
-If any check fails: either move the project to a Dev Drive, or skip the
-cache clone (`$Clone = @()`) and accept a Unity reimport on first open.
+If the project isn't on a ReFS Dev Drive: move it, or skip the cache clone
+(`$Clone = @()`) and accept a full Unity reimport on first open.
 
 ## Procedure
 
-Run from inside the source worktree. Replace `<branch>` and adjust `$Clone`
-for non-Unity projects.
+Run from inside the source worktree. Replace `<branch>`.
 
 ```powershell
 # --- Inputs ---
@@ -57,7 +55,7 @@ $Branch = '<branch-name>'
 $Source = (Get-Location).Path
 $Dest   = Join-Path (Split-Path $Source -Parent) `
                     ((Split-Path $Source -Leaf) + '-' + ($Branch -replace '[\\/:*?"<>|]', '-'))
-$Clone  = @('Library', 'Logs', 'obj', 'Packages')   # Unity defaults; see below
+$Clone  = @('Library', 'Logs', 'obj', 'Packages')   # NOTE: never include Temp — see pitfalls
 
 # --- Sanity: same ReFS volume ---
 $srcRoot = (Split-Path $Source -Qualifier) + '\'
@@ -90,12 +88,6 @@ foreach ($dir in $Clone) {
 Write-Host "Worktree ready: $Dest"
 ```
 
-### Non-Unity `$Clone` sets
-
-- Node: `@('node_modules', '.next', 'dist')`
-- Rust: `@('target')`
-- Docs/text-only: `@()`
-
 ## Cleanup
 
 ```powershell
@@ -112,9 +104,8 @@ drop the stale entry.
 - **Never clone `Temp/`.** `Temp/UnityLockfile` contains the source Editor's
   live PID. If the source Editor is running, Unity reads that PID in the
   cloned file and refuses to open the new worktree. `Temp/` is session
-  state, not cache. The `/XF UnityLockfile` flag above is a defensive guard
-  if a caller adds `Temp` to `$Clone` anyway. Recovery: delete
-  `<dest>\Temp\UnityLockfile`.
+  state, not cache. The `/XF UnityLockfile` flag above is a defensive guard.
+  Recovery: delete `<dest>\Temp\UnityLockfile`.
 - **One Editor per worktree path.** Two worktrees can each have their own
   Editor open — they're separate paths with separate `Library/`. Just don't
   open the same path twice.
