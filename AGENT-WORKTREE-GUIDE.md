@@ -1,172 +1,141 @@
-# Agent guide: working with git worktrees (Windows + Unity + Dev Drive)
+# Agent guide: git worktrees on Windows + Unity + Dev Drive
 
-This document tells an AI agent how to use git worktrees in this environment
-without re-deriving the setup each time. Copy or symlink it into project roots
-so agents pick it up.
+Drop this file into a project to teach an AI agent how to spin up a worktree
+correctly here. It's self-contained — the agent can execute the commands
+below without any helper script.
 
-## TL;DR
+## When to use a worktree
 
-- Use worktrees for **any parallel branch work**: experimental refactors, AI
-  agent sandboxes, reviewing a PR while keeping main checked out, running long
-  builds without blocking other edits.
-- All worktrees of a Unity project **must live on the same Dev Drive (ReFS)
-  volume** as the source, so ReFS block cloning makes the copy free.
-- Create a worktree with `New-Worktree.ps1` (see "Script" below). Do **not**
-  hand-roll `git worktree add` for Unity projects — you'll get a worktree with
-  no `Library/` and Unity will spend hours reimporting.
-- Clean up with `git worktree remove <path>`. Never `rm -rf` a worktree dir
-  before unregistering it.
+Create one for parallel branch work where you can't disturb the current
+working tree:
 
-## Why this setup exists
+- Long-running build artifacts shouldn't be invalidated.
+- The user is actively editing on another branch.
+- Multiple agents working in parallel.
+- Reviewing a PR while keeping the current branch open in Unity.
 
-Unity's `Library/`, `Temp/`, `Logs/`, `obj/` are gitignored caches. A fresh
-worktree is missing them, so opening it in Unity triggers a full asset
-reimport — minutes to hours depending on project size.
+For a tiny change on a clean tree, just switch branches or stash — skip the
+worktree.
 
-On a Dev Drive (Windows 11 ReFS volume), `robocopy` performs **block cloning**:
-the destination references the same on-disk extents as the source. Cloning a
-30 GB `Library/` takes seconds and adds ~0 disk usage until Unity modifies
-files. Each modified file is copy-up'd individually; the source is never
-touched.
+## Why the cache-clone matters (Unity)
+
+A fresh `git worktree add` only checks out tracked files. Unity's `Library/`,
+`Logs/`, `obj/`, `Packages/` are gitignored caches; without them, Unity does
+a full reimport (minutes to hours) on first open.
+
+On a Windows 11 24H2 **Dev Drive (ReFS)**, `robocopy` block-clones: the
+destination references the same on-disk extents as the source. Cloning a
+30 GB `Library/` is seconds and ~0 extra disk. Modified files copy-up
+individually — the source is never touched.
 
 ## Prerequisites (verify before creating worktrees)
 
 ```powershell
-# 1. Source must be on ReFS Dev Drive
+# 1. Source must be on ReFS
 Get-Volume -FilePath (Get-Location).Path | Select FileSystemType, DriveLetter
 # Expect: FileSystemType = ReFS
 
-# 2. Dev Drive must be designated as such (gives perf-mode AV + block clone)
+# 2. Volume must be a Dev Drive
 fsutil devdrv query <DriveLetter>:
 # Expect: "This is a trusted developer volume."
 
-# 3. Windows 11 build 26100 (24H2) or newer — block clone for Dev Drive
+# 3. Windows 11 build 26100 (24H2) or newer
 [System.Environment]::OSVersion.Version
 ```
 
-If any check fails:
-- Not on Dev Drive → see the main README's "Setting up a Dev Drive" section,
-  or fall back to plain `git worktree add` and accept a slow first Unity open.
-- Old Windows → upgrade to 24H2 or fall back to slow copy.
+If any check fails: either move the project to a Dev Drive, or skip the
+cache clone (`$Clone = @()`) and accept a Unity reimport on first open.
 
-## Script
+## Procedure
 
-`New-Worktree.ps1` in this repo — usage (adjust path to wherever you put the repo):
+Run from inside the source worktree. Replace `<branch>` and adjust `$Clone`
+for non-Unity projects.
 
 ```powershell
-# From inside the source repo:
-& C:\Users\simen\Documents\GitHub\worktree-cow\New-Worktree.ps1 -Branch feature/foo
-# Creates <repo>-feature-foo alongside the current repo, with Library/ etc. cloned.
+# --- Inputs ---
+$Branch = '<branch-name>'
+$Source = (Get-Location).Path
+$Dest   = Join-Path (Split-Path $Source -Parent) `
+                    ((Split-Path $Source -Leaf) + '-' + ($Branch -replace '[\\/:*?"<>|]', '-'))
+$Clone  = @('Library', 'Logs', 'obj', 'Packages')   # Unity defaults; see below
 
-# With explicit dest:
-& <repo>\New-Worktree.ps1 -Branch hotfix -Dest V:\unity\MyGame-hotfix
+# --- Sanity: same ReFS volume ---
+$srcRoot = (Split-Path $Source -Qualifier) + '\'
+$dstRoot = (Split-Path $Dest   -Qualifier) + '\'
+if ($srcRoot -ne $dstRoot) { throw "Source and Dest must be on the same volume." }
+if ((Get-Volume -FilePath $srcRoot).FileSystemType -ne 'ReFS') {
+    throw "Source not on ReFS — block clone unavailable. Skip cache clone or move to Dev Drive."
+}
 
-# Plain worktree, no cache clone (e.g. docs-only branches):
-& <repo>\New-Worktree.ps1 -Branch docs -Clone @()
+# --- Create the worktree ---
+$exists = (& git -C $Source branch --list $Branch) -or `
+          (& git -C $Source branch --list --remotes "*/$Branch")
+if ($exists) {
+    & git -C $Source worktree add $Dest $Branch
+} else {
+    & git -C $Source worktree add -b $Branch $Dest
+}
+if ($LASTEXITCODE -ne 0) { throw "git worktree add failed" }
 
-# Non-Unity project — override clone list:
-& <repo>\New-Worktree.ps1 -Branch x -Clone @('node_modules', '.next', 'dist')
+# --- Block-clone cache dirs ---
+foreach ($dir in $Clone) {
+    $srcDir = Join-Path $Source $dir
+    $dstDir = Join-Path $Dest   $dir
+    if (-not (Test-Path $srcDir)) { continue }
+    # /XF UnityLockfile: never clone Unity's PID-bearing lock.
+    & robocopy $srcDir $dstDir /E /MT:16 /NFL /NDL /NJH /NP /R:1 /W:1 /XF UnityLockfile | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Warning "robocopy errors in $dir (exit $LASTEXITCODE)" }
+}
+
+Write-Host "Worktree ready: $Dest"
 ```
 
-Parameters:
-- `-Branch` (required) — branch name; created from HEAD if it doesn't exist.
-- `-Source` (default: cwd) — source worktree path.
-- `-Dest` (default: `<source>-<branch>` sibling dir).
-- `-Clone` (default: `Library, Logs, obj, Packages` — Unity defaults; `Temp/` is
-  deliberately excluded because `Temp/UnityLockfile` carries the source Editor's
-  live PID and would block opening the new worktree).
-- `-Force` — proceed without CoW (falls back to full copy; slow).
+### Non-Unity `$Clone` sets
 
-## Workflow for an agent
+- Node: `@('node_modules', '.next', 'dist')`
+- Rust: `@('target')`
+- Docs/text-only: `@()`
 
-When asked to work on a separate branch / try an experiment / review a PR
-without disturbing the user's current state:
-
-1. **Confirm need for a worktree.** If the change is small and the user's
-   working tree is clean, a normal branch switch may suffice. Use worktrees
-   when: long-running build artifacts shouldn't be invalidated, the user is
-   actively editing, multiple agents are working in parallel, or the user
-   explicitly asks.
-
-2. **Locate the source repo root** (`git rev-parse --show-toplevel`).
-
-3. **Run the script:**
-   ```powershell
-   & <path-to>\New-Worktree.ps1 -Branch <branch-name>
-   ```
-
-4. **`cd` into the new worktree** and do work there. Commit normally.
-
-5. **Push and/or merge** when done.
-
-6. **Clean up:**
-   ```powershell
-   git -C <source> worktree remove <dest>
-   # If the worktree has uncommitted changes, --force is required;
-   # only use it after confirming with the user.
-   ```
-
-7. **List worktrees to verify:**
-   ```powershell
-   git worktree list
-   ```
-
-## Caveats and pitfalls
-
-- **Two worktrees can each have their own Unity Editor open** — they're separate
-  project paths with separate `Library/` and `Temp/`. The constraint is *one
-  Editor per worktree*: don't launch two Editors against the same on-disk path.
-- **Never clone `Temp/` between worktrees.** `Temp/UnityLockfile` contains the
-  source Editor's PID; if the source Editor is running, Unity will see the live
-  PID in the cloned lockfile and refuse to open the new worktree. The script
-  excludes `Temp/` from the default clone list and also passes
-  `robocopy /XF UnityLockfile` as a belt-and-suspenders guard. If you ever hit
-  this manually (e.g. after a hand-rolled copy), delete `Temp/UnityLockfile` in
-  the new worktree before opening it.
-- **Cross-volume copies break CoW.** If `-Dest` is on a different volume than
-  `-Source`, robocopy falls back to full copy. The script warns about this
-  and refuses unless `-Force` is passed.
-- **NTFS volumes don't support block clone.** Only ReFS / Dev Drive. The
-  script detects this and warns.
-- **Don't symlink `Library/` between worktrees.** Both worktrees would share
-  state and Unity would mangle them.
-- **Don't `rm` a worktree directory before `git worktree remove`.** It leaves
-  a stale entry; recover with `git worktree prune`.
-- **First Unity open in the new worktree** may copy-up parts of `Library/`
-  (validation, version-specific caches). That's expected and one-time.
-- **Switching Unity versions or platforms** in a worktree forces a big
-  reimport — copy-up will dominate. The CoW savings shine on same-version
-  same-platform branch work, not on major platform switches.
-
-## Common operations cheat sheet
+## Cleanup
 
 ```powershell
-# List all worktrees
+git -C <source> worktree remove <dest>
+# Add --force only if there are uncommitted changes you've confirmed are disposable.
+git worktree list   # verify
+```
+
+If a worktree directory was deleted manually, run `git worktree prune` to
+drop the stale entry.
+
+## Critical pitfalls
+
+- **Never clone `Temp/`.** `Temp/UnityLockfile` contains the source Editor's
+  live PID. If the source Editor is running, Unity reads that PID in the
+  cloned file and refuses to open the new worktree. `Temp/` is session
+  state, not cache. The `/XF UnityLockfile` flag above is a defensive guard
+  if a caller adds `Temp` to `$Clone` anyway. Recovery: delete
+  `<dest>\Temp\UnityLockfile`.
+- **One Editor per worktree path.** Two worktrees can each have their own
+  Editor open — they're separate paths with separate `Library/`. Just don't
+  open the same path twice.
+- **Cross-volume or NTFS = full byte copy.** Block clone requires the same
+  ReFS volume on both ends. The check above refuses to proceed.
+- **Don't symlink `Library/` between worktrees.** They'd share state and
+  Unity would mangle it.
+- **Don't `rm` a worktree before `git worktree remove`.** Leaves a stale
+  entry — recover with `git worktree prune`.
+- **Major reimports** (Unity version upgrade, platform switch, Reimport All)
+  copy-up most of `Library/`. CoW shines on same-version same-platform
+  branch work, not platform switches.
+
+## Cheat sheet
+
+```powershell
 git worktree list
-
-# Remove a worktree (clean — no uncommitted changes)
 git worktree remove <path>
-
-# Force-remove (uncommitted changes will be lost)
-git worktree remove --force <path>
-
-# Clean up after a manual rm
-git worktree prune
-
-# Lock a worktree to prevent automatic prune (e.g. on removable disk)
-git worktree lock <path> --reason "long-running experiment"
+git worktree remove --force <path>     # uncommitted changes will be lost
+git worktree prune                     # after a manual rm
+git worktree lock <path> --reason "..."
 git worktree unlock <path>
-
-# Move a worktree
 git worktree move <from> <to>
 ```
-
-## When NOT to use this workflow
-
-- Tiny changes that don't need a separate working tree → just commit on a
-  branch or stash.
-- Projects already on NTFS and you can't move them → block clone won't work,
-  full copy of `Library/` is slow. Either move the project to a Dev Drive
-  first, or skip the cache clone (`-Clone @()`) and accept a Unity reimport.
-- Repos where the cache dirs are tiny (most non-Unity projects) → a plain
-  `git worktree add` is fine.
